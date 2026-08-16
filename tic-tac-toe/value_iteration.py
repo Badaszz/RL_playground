@@ -3,9 +3,15 @@ value_iteration.py
 -------------------
 Value Iteration agent for Tic Tac Toe (always plays 'O').
 
+States are (board, player_to_move) pairs so the Bellman backup correctly
+alternates turns: O's node takes the max over its actions, X's node takes
+the min (X is treated as an adversary choosing the worst outcome for O),
+so the learned policy never picks up on a phantom "O moves twice in a
+row" shortcut.
+
 Pipeline (see main()):
     1. Prompt for iterations / discount, then run value iteration over
-       every reachable state.
+       every reachable (board, player) state.
     2. Play a batch of games against a random opponent and report stats.
     3. Play interactively against the user (pygame window). The policy is
        fixed at this point - the agent does not learn while playing.
@@ -30,17 +36,18 @@ class ValueIteration:
     # -- state / table generation (kept out of utils.py on purpose) --------
 
     def generate_all_states(self):
-        """Enumerate every reachable board state via exhaustive recursion,
-        then allocate a state-value and a Q-value entry (per legal action)
-        for each one."""
+        """Enumerate every reachable (board, player_to_move) state via
+        exhaustive recursion, then allocate a state-value and a Q-value
+        entry (per legal action) for each non-terminal one."""
 
         def _generate(board, player, states):
-            winner = utils.check_win_state(board)
-            if winner is not None:
-                states.add(tuple(tuple(row) for row in board))
-                return
+            board_t = tuple(tuple(row) for row in board)
+            state = (board_t, player)
+            states.add(state)
 
-            states.add(tuple(tuple(row) for row in board))
+            winner = utils.check_win_state(board_t)
+            if winner is not None:
+                return
 
             for i in range(3):
                 for j in range(3):
@@ -54,21 +61,28 @@ class ValueIteration:
         initial_board = [[0, 0, 0],
                           [0, 0, 0],
                           [0, 0, 0]]
+        # Suppose player 1 (X) starts
         _generate(initial_board, 1, states)
-        print(len(states))  # This will print the number of unique states generated
+        print(f"Total reachable states: {len(states)}")
 
         self.states = states
-        self.state_values = {state: 0.0 for state in states}
-        self.q_values = {state: {} for state in states}
+        self.state_values = {}
+        self.q_values = {}
 
         for state in states:
-            for action in utils.get_empty_spots(state):
-                self.q_values[state][action] = 0.0
+            board, player = state
 
-        count = 0
-        for state, actions in self.q_values.items():
-            for action, value in actions.items():
-                count += 1
+            # Terminal states have no actions
+            if utils.check_win_state(board) is not None:
+                self.state_values[state] = 0.0
+                self.q_values[state] = {}
+                continue
+
+            actions = utils.get_empty_spots(board)
+            self.state_values[state] = 0.0
+            self.q_values[state] = {action: 0.0 for action in actions}
+
+        count = sum(len(actions) for actions in self.q_values.values())
         print(f"Total state-action pairs: {count}")
 
         return self.states
@@ -76,15 +90,21 @@ class ValueIteration:
     # -- training ------------------------------------------------------
 
     def train(self, iterations):
-        """Sweep every state/action pair `iterations` times, updating
-        state values and Q-values via the Bellman equation. The agent
-        always evaluates actions as if it is placing 'O' (2)."""
+        """Sweep every non-terminal (board, player) state `iterations`
+        times, updating state values and Q-values via the Bellman
+        equation - maximizing at O's nodes, minimizing at X's nodes."""
         for _ in tqdm(range(iterations), desc="Value Iteration", ncols=80):
-            for state in self.states:
-                for action in utils.get_empty_spots(state):
-                    new_board = [list(row) for row in state]
-                    new_board[action[0]][action[1]] = 2
-                    new_state = tuple(tuple(row) for row in new_board)
+            for state in self.state_values:
+                board, player = state
+
+                # Terminal state
+                if utils.check_win_state(board) is not None:
+                    continue
+
+                for action in utils.get_empty_spots(board):
+                    new_board = [list(row) for row in board]
+                    new_board[action[0]][action[1]] = player
+                    new_state_board = tuple(tuple(row) for row in new_board)
 
                     winner = utils.check_win_state(new_board)
                     if winner == 1:
@@ -96,24 +116,33 @@ class ValueIteration:
                     else:
                         reward = -0.05
 
-                    max_curr_q = max(self.q_values[state].values(), default=0.0)
-                    self.state_values[state] = max_curr_q
+                    if winner is not None:
+                        future_value = 0.0
+                    else:
+                        # Switch to the other player
+                        next_player = 1 if player == 2 else 2
+                        next_state = (new_state_board, next_player)
+                        future_value = self.state_values[next_state]
 
-                    try:
-                        max_future_q = max(self.q_values[new_state].values(), default=0.0)
-                    except KeyError:
-                        self.q_values[new_state] = {a: 0.0 for a in utils.get_empty_spots(new_state)}
-                        max_future_q = 0.0
-                    self.q_values[state][action] = reward + self.discount * max_future_q
+                    # Update Q-value using the Bellman equation
+                    self.q_values[state][action] = reward + self.discount * future_value
+
+                    # Choose max for our turn, min for opponent's turn
+                    if player == 2:
+                        self.state_values[state] = max(self.q_values[state].values())
+                    else:
+                        self.state_values[state] = min(self.q_values[state].values())
 
     # -- acting ----------------------------------------------------------
 
-    def best_action(self, state):
-        """Greedy action for a state, falling back to a random empty spot
-        for states the value iteration sweep never populated."""
+    def best_action(self, board_state):
+        """Greedy O action for a board (tuple-of-tuples), looked up at the
+        O-to-move node. Falls back to a random empty spot for boards the
+        sweep never populated."""
+        state = (board_state, 2)
         actions = self.q_values.get(state, {})
         if not actions:
-            return utils.random_move(state)
+            return utils.random_move(board_state)
         action, _ = max(actions.items(), key=lambda item: item[1])
         return action
 
@@ -265,8 +294,15 @@ class ValueIteration:
     # -- export --------------------------------------------------------
 
     def export_json(self, q_path="value_iteration_q_values.json", policy_path="value_iteration_policy.json"):
-        utils.export_q_values(self.q_values, q_path)
-        utils.export_policy(self.q_values, policy_path)
+        """Only the O-to-move nodes make up a usable policy, so we strip
+        the player index and export those boards' Q-values/greedy policy."""
+        o_turn_q_values = {
+            board: actions
+            for (board, player), actions in self.q_values.items()
+            if player == 2 and actions
+        }
+        utils.export_q_values(o_turn_q_values, q_path)
+        utils.export_policy(o_turn_q_values, policy_path)
 
 
 def main():
@@ -278,6 +314,9 @@ def main():
 
     num_games = render.prompt_for_eval_games()
     win_count, loss_count, stalemate_count = agent.play_vs_random(num_games)
+    
+    ## Export Q_values and policy to json after training
+    agent.export_json()
 
     print(f'=========== Vs. Random Results ===========')
     print(f'At {num_games} games, the current stats are:')
@@ -289,7 +328,7 @@ def main():
     player_choice = render.prompt_for_player_choice()
     agent.play_vs_user(player_choice)
 
-    agent.export_json()
+    
 
 
 if __name__ == "__main__":
